@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gateway.API/Gateway.API.csproj" />
+    <Project Path="src/Gateway.AuthService/Gateway.AuthService.csproj" />
+    <Project Path="src/Gateway.Core/Gateway.Core.csproj" />
+    <Project Path="src/Gateway.Infrastructure/Gateway.Infrastructure.csproj" />
+    <Project Path="src/Gateway.Tests/Gateway.Tests.csproj" />
+  </Folder>
+</Solution>

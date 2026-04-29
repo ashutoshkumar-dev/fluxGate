@@ -1,0 +1,50 @@
+# .NET build outputs
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# EF Core migrations temp
+*.db
+*.db-shm
+*.db-wal
+
+# ASP.NET Core secrets / keys
+**/rsa_private.pem
+**/rsa_public.pem
+src/Gateway.AuthService/Security/*.pem
+src/Gateway.AuthService/Security/*.xml
+
+# Environment / secrets
+.env
+*.local
+appsettings.Production.json
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# Test results
+TestResults/
+coverage/
+*.trx
+*.coverage
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# JetBrains IDEs
+.idea/
+
+# VS Code (keep workspace settings, ignore personal)
+.vscode/launch.json

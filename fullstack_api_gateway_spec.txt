@@ -1,0 +1,706 @@
+FULLSTACK API GATEWAY PROJECT — FORMAL SPEC (SPEC-DRIVEN DEVELOPMENT)
+Version: 2.0  |  Date: 2026-04-28
+
+================================================================================
+PROJECT GOAL
+================================================================================
+
+Build a production-grade API Gateway with dynamic routing, dual authentication
+(JWT + API Key), rate limiting, full observability, and a React admin dashboard.
+The system is composed of two backend services (Auth Service + Gateway) and one
+frontend application, all containerised and spec-driven across 11 sequential phases.
+
+================================================================================
+1. SYSTEM ARCHITECTURE
+================================================================================
+
+  Browser / API Client
+        |
+        |---> Auth Service  (POST /auth/login -> issues JWT, POST /auth/apikeys)
+        |           |
+        |           +-- exposes GET /.well-known/jwks.json  (RS256 public key)
+        |
+        +--->  React Admin UI
+                    |
+                    v
+             API Gateway  <-- validates JWT signature via cached JWKS
+                    |      <-- validates API Key via DB lookup
+                    |
+                    |---> Downstream Services  (YARP reverse proxy)
+                    |---> Redis               (rate limit counters, response cache)
+                    |---> PostgreSQL          (routes, users, api_keys)
+                    +---> Seq                 (structured logs via Serilog)
+
+Logs flow:
+  Gateway -> Serilog -> Seq -> Logs API queries Seq HTTP API -> Admin UI
+
+Metrics flow:
+  Gateway -> prometheus-net counters -> /metrics (Prometheus scrape)
+                                     -> GET /metrics/summary (JSON for Admin UI)
+
+================================================================================
+2. TECHNOLOGY STACK
+================================================================================
+
+Backend
+  Runtime:       .NET 8
+  Framework:     ASP.NET Core Web API
+  Proxy:         YARP (Microsoft.ReverseProxy)
+  ORM:           Entity Framework Core 8 + Npgsql
+  Auth (issue):  Custom Auth Service, RS256 JWT via System.IdentityModel.Tokens.Jwt
+  Auth (verify): JWT bearer validation in Gateway (JWKS, no roundtrip)
+  API Keys:      Custom scheme, X-Api-Key header, DB-backed
+  Validation:    FluentValidation
+  Resilience:    Polly v8 (retry, circuit breaker)
+  Rate Limit:    StackExchange.Redis (sliding window)
+  Logging:       Serilog -> Serilog.Sinks.Seq
+  Metrics:       prometheus-net.AspNetCore
+  Testing:       xUnit, Moq, FluentAssertions, Testcontainers
+
+Frontend
+  Build:         Vite + React 18
+  Routing:       React Router v6
+  State:         Zustand
+  HTTP:          Axios (service layer)
+  UI:            Tailwind CSS + shadcn/ui
+  Charts:        Recharts
+  Validation:    Zod + react-hook-form
+
+Infrastructure (Docker Compose)
+  PostgreSQL 16
+  Redis 7
+  Seq (latest)
+  Prometheus + Grafana (Phase 7)
+
+================================================================================
+3. SOLUTION STRUCTURE
+================================================================================
+
+Fluxgate/
+ +-- src/
+ |    +-- Gateway.API/             ASP.NET Core -- YARP proxy, middleware pipeline
+ |    +-- Gateway.AuthService/     ASP.NET Core -- token issuance, user management
+ |    +-- Gateway.Core/            Domain models, interfaces, DTOs
+ |    +-- Gateway.Infrastructure/  EF Core, Repos, Redis, Seq client, JWKS fetcher
+ |    +-- Gateway.Tests/           xUnit -- unit + integration tests
+ +-- frontend/                     Vite React app
+ +-- docker-compose.yml
+ +-- docker-compose.override.yml   (dev overrides)
+ +-- README.md
+
+================================================================================
+4. DATABASE DESIGN (PostgreSQL)
+================================================================================
+
+Table: routes
+  id              UUID          PK, default gen_random_uuid()
+  path            TEXT          NOT NULL
+  method          TEXT          NOT NULL   (GET | POST | PUT | DELETE | *)
+  destination     TEXT          NOT NULL
+  auth_required   BOOLEAN       NOT NULL DEFAULT true
+  roles           JSONB         NOT NULL DEFAULT '[]'
+  rate_limit      JSONB         NOT NULL DEFAULT '{}'
+                                  { "limit": 100, "windowSeconds": 60 }
+  is_active       BOOLEAN       NOT NULL DEFAULT true
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+
+Table: users
+  id              UUID          PK
+  username        TEXT          UNIQUE NOT NULL
+  email           TEXT          UNIQUE NOT NULL
+  password_hash   TEXT          NOT NULL   (bcrypt)
+  roles           JSONB         NOT NULL DEFAULT '["user"]'
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+
+Table: api_keys
+  id              UUID          PK
+  key_hash        TEXT          UNIQUE NOT NULL   (SHA-256 hash; raw key shown once)
+  owner_service   TEXT          NOT NULL
+  scopes          JSONB         NOT NULL DEFAULT '[]'
+  is_active       BOOLEAN       NOT NULL DEFAULT true
+  created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+  expires_at      TIMESTAMPTZ   NULL
+
+================================================================================
+5. REDIS DESIGN
+================================================================================
+
+Rate limit key:
+  rate_limit:{userId}:{normalizedPath}
+  Value: request count (INCR)
+  TTL:   windowSeconds (set on first INCR via EXPIRE)
+
+Response cache key (Phase 11):
+  cache:{method}:{normalizedPath}:{queryHash}
+  Value: serialised response body
+  TTL:   per-route cache TTL
+
+================================================================================
+6. MIDDLEWARE PIPELINE (Gateway.API)
+================================================================================
+
+Order (outermost -> innermost):
+  1. Exception Handling Middleware    -- catch-all, structured error response
+  2. Logging Middleware               -- Serilog request/response enrichment -> Seq
+  3. Metrics Middleware               -- prometheus-net counter increment
+  4. Authentication Middleware        -- JWT (primary) / API Key (secondary)
+  5. Rate Limiting Middleware         -- Redis sliding window; returns 429
+  6. YARP Routing Middleware          -- forwards to destination
+
+================================================================================
+7. API CONTRACTS
+================================================================================
+
+-------------------------------
+7.1 Auth Service APIs  (base: http://localhost:5100)
+
+POST /auth/register
+  Body:  { "username": "string", "email": "string", "password": "string" }
+  201:   { "id": "uuid", "username": "string", "email": "string" }
+  409:   username or email already exists
+
+POST /auth/login
+  Body:  { "username": "string", "password": "string" }
+  200:   { "accessToken": "JWT string", "expiresIn": 3600 }
+  401:   invalid credentials
+
+POST /auth/apikeys
+  Auth:  Bearer JWT (role: admin)
+  Body:  { "ownerService": "string", "scopes": ["string"] }
+  201:   { "id": "uuid", "rawKey": "string" }   <- rawKey shown ONCE
+
+GET /.well-known/jwks.json
+  200:   standard JWKS JSON (RSA public key, kid, alg: RS256)
+
+-------------------------------
+7.2 Gateway -- Route Management APIs  (base: http://localhost:5000)
+
+POST /gateway/routes
+  Auth:  Bearer JWT (role: admin)
+  Body:  RouteCreateDto (see below)
+  201:   RouteDto
+  400:   validation errors
+
+GET /gateway/routes
+  Auth:  Bearer JWT (role: admin | viewer)
+  Query: ?isActive=true|false  (optional filter)
+  200:   RouteDto[]
+
+PUT /gateway/routes/{id}
+  Auth:  Bearer JWT (role: admin)
+  Body:  RouteUpdateDto
+  200:   RouteDto
+  404:   not found
+
+DELETE /gateway/routes/{id}
+  Auth:  Bearer JWT (role: admin)
+  204:   no content
+  404:   not found
+
+RouteCreateDto / RouteUpdateDto:
+{
+  "path":         "/orders",
+  "method":       "GET",
+  "destination":  "http://order-service/api/orders",
+  "authRequired": true,
+  "roles":        ["admin", "user"],
+  "rateLimit":    { "limit": 100, "windowSeconds": 60 },
+  "isActive":     true
+}
+
+RouteDto (response):
+{
+  "id":           "uuid",
+  "path":         "/orders",
+  "method":       "GET",
+  "destination":  "http://order-service/api/orders",
+  "authRequired": true,
+  "roles":        ["admin", "user"],
+  "rateLimit":    { "limit": 100, "windowSeconds": 60 },
+  "isActive":     true,
+  "createdAt":    "ISO8601",
+  "updatedAt":    "ISO8601"
+}
+
+-------------------------------
+7.3 Gateway -- Metrics APIs
+
+GET /metrics
+  (Prometheus scrape endpoint -- text/plain; version=0.0.4)
+
+GET /metrics/summary
+  Auth:  Bearer JWT (role: admin | viewer)
+  200:
+  {
+    "totalRequests": 10000,
+    "errorRate":     2.3,
+    "avgLatencyMs":  120,
+    "topRoutes": [
+      { "path": "/orders", "count": 5000 }
+    ]
+  }
+
+-------------------------------
+7.4 Gateway -- Health API
+
+GET /health
+  200:  { "status": "healthy", "timestamp": "ISO8601" }
+
+-------------------------------
+7.5 Gateway -- Logs API
+
+GET /logs
+  Auth:  Bearer JWT (role: admin | viewer)
+  Query: ?status=500&route=/orders&from=ISO8601&to=ISO8601&page=1&pageSize=50
+  200:
+  {
+    "total": 120,
+    "page":  1,
+    "items": [
+      {
+        "timestamp":  "ISO8601",
+        "level":      "Error",
+        "route":      "/orders",
+        "statusCode": 500,
+        "latencyMs":  340,
+        "message":    "Upstream timeout",
+        "traceId":    "string"
+      }
+    ]
+  }
+  Implementation: query Seq HTTP API (GET /api/events)
+                  filter via Seq clef filter expressions
+
+================================================================================
+8. FRONTEND STRUCTURE
+================================================================================
+
+frontend/src/
+ +-- components/
+ |    +-- layout/       Navbar.jsx, Sidebar.jsx, Layout.jsx
+ |    +-- routes/       RouteTable.jsx, RouteForm.jsx, DeleteDialog.jsx
+ |    +-- metrics/      MetricsCards.jsx, RequestsChart.jsx, ErrorRateChart.jsx
+ |    +-- logs/         LogsTable.jsx, LogsFilters.jsx
+ |    +-- ui/           shadcn/ui re-exports
+ +-- pages/
+ |    +-- DashboardPage.jsx
+ |    +-- RoutesPage.jsx
+ |    +-- LogsPage.jsx
+ |    +-- MetricsPage.jsx
+ +-- services/
+ |    +-- api.js              Axios instance, base URL, interceptors
+ |    +-- routesService.js
+ |    +-- metricsService.js
+ |    +-- logsService.js
+ +-- store/
+ |    +-- useRoutesStore.js   Zustand
+ |    +-- useMetricsStore.js
+ |    +-- useAuthStore.js
+ +-- hooks/
+ |    +-- useDebounce.js
+ +-- utils/
+ |    +-- formatters.js
+ +-- App.jsx
+
+React Router paths:
+  /dashboard  -> DashboardPage  (MetricsCards + Charts summary)
+  /routes     -> RoutesPage     (RouteTable + RouteForm)
+  /logs       -> LogsPage       (LogsTable + Filters)
+  /metrics    -> MetricsPage    (Full charts + Rate Limit Monitor)
+
+================================================================================
+9. PHASE-BY-PHASE SPEC
+================================================================================
+
+Each phase defines: Goal | Deliverables | Acceptance Criteria | Out of Scope
+All AC must pass before the next phase begins.
+
+--------------------------------------------------------------------------------
+PHASE 1 -- Foundation & Infrastructure
+--------------------------------------------------------------------------------
+Goal:
+  Runnable skeleton. All infrastructure services up. Health endpoint live.
+  Logging flowing to Seq.
+
+Deliverables:
+  [ ] .NET 8 solution with 5 projects (API, AuthService, Core, Infrastructure, Tests)
+  [ ] Docker Compose: postgres:16, redis:7, seq:latest
+  [ ] appsettings.json: ConnectionStrings, Seq URL, JWT placeholder config
+  [ ] Serilog configured in Gateway.API -> Seq sink
+  [ ] EF Core DbContext in Gateway.Infrastructure, connection verified
+  [ ] GET /health returns 200 + timestamp
+  [ ] README: how to run locally
+
+Acceptance Criteria:
+  AC1: `docker compose up` starts Postgres, Redis, Seq without errors
+  AC2: `dotnet run` on Gateway.API starts without errors
+  AC3: GET http://localhost:5000/health -> 200 { "status": "healthy" }
+  AC4: Seq UI (http://localhost:5341) shows at least one log event from Gateway
+  AC5: `dotnet ef database update` applies initial migration successfully
+
+Out of Scope: Auth, routes table, YARP, any business logic
+
+--------------------------------------------------------------------------------
+PHASE 2 -- Route Management CRUD
+--------------------------------------------------------------------------------
+Goal:
+  Full CRUD for gateway routes, persisted in Postgres, validated, unit tested.
+
+Deliverables:
+  [ ] Route entity + EF Core migration (routes table)
+  [ ] IRouteRepository interface in Gateway.Core
+  [ ] RouteRepository implementation in Gateway.Infrastructure
+  [ ] RouteService in Gateway.Core with Create/Read/Update/Delete
+  [ ] RouteCreateDto, RouteUpdateDto, RouteDto in Gateway.Core
+  [ ] FluentValidation validators for create and update DTOs
+  [ ] RoutesController in Gateway.API exposing all 4 endpoints
+  [ ] Unit tests: RouteService (mock repository), validator tests
+  [ ] Endpoints are UNAUTHENTICATED in this phase (auth added Phase 5)
+
+Acceptance Criteria:
+  AC1: POST /gateway/routes -> 201 with persisted RouteDto
+  AC2: GET /gateway/routes -> 200 array; ?isActive=true filters correctly
+  AC3: PUT /gateway/routes/{id} -> 200 updated; unknown id -> 404
+  AC4: DELETE /gateway/routes/{id} -> 204; unknown id -> 404
+  AC5: POST with missing path/method/destination -> 400 with field errors
+  AC6: All RouteService unit tests pass
+
+Out of Scope: YARP, auth, rate limit, metrics
+
+--------------------------------------------------------------------------------
+PHASE 3 -- Auth Service
+--------------------------------------------------------------------------------
+Goal:
+  Standalone Auth Service that issues RS256 JWTs, manages users and API keys,
+  and exposes a JWKS endpoint.
+
+Deliverables:
+  [ ] Gateway.AuthService project: ASP.NET Core Web API on port 5100
+  [ ] RSA key pair: generated on startup (dev); config/secrets path for prod
+  [ ] Users table + migration in AuthService DbContext
+  [ ] ApiKeys table + migration
+  [ ] POST /auth/register -- bcrypt password hash, store user
+  [ ] POST /auth/login -- verify bcrypt, issue RS256 JWT (sub, email, roles, exp)
+  [ ] POST /auth/apikeys -- admin-only, generate key, store SHA-256 hash, return raw once
+  [ ] GET /.well-known/jwks.json -- exposes RSA public key as JWKS
+  [ ] JWT claims: sub (userId), email, roles[], iat, exp (1h default)
+  [ ] Unit tests: login success/failure, token claims, JWKS structure
+
+Acceptance Criteria:
+  AC1: POST /auth/register -> 201; duplicate username -> 409
+  AC2: POST /auth/login -> 200 with valid JWT; wrong password -> 401
+  AC3: Decoded JWT contains correct sub, email, roles claims
+  AC4: GET /.well-known/jwks.json -> valid JWKS JSON with RS256 public key
+  AC5: POST /auth/apikeys with admin JWT -> 201 with rawKey; rawKey not stored in DB
+  AC6: API key DB entry stores only SHA-256 hash of rawKey
+
+Out of Scope: Gateway integration, rate limit, YARP
+
+--------------------------------------------------------------------------------
+PHASE 4 -- YARP Dynamic Proxy
+--------------------------------------------------------------------------------
+Goal:
+  Gateway proxies requests to downstream destinations using routes loaded
+  from Postgres. Route changes hot-reload without restart.
+
+Deliverables:
+  [ ] YARP NuGet package added to Gateway.API
+  [ ] DatabaseProxyConfigProvider : IProxyConfigProvider
+        loads active routes from DB on startup
+        implements change token for hot-reload
+  [ ] RouteChangeNotifier service: called by RoutesController after CUD ops
+        triggers IProxyConfigProvider reload
+  [ ] isActive=false routes excluded from YARP config
+  [ ] method matching: route.Method applied to YARP route match
+  [ ] Integration test: register route, send request, verify forwarded
+      (Testcontainers for Postgres + WireMock.Net for downstream)
+
+Acceptance Criteria:
+  AC1: POST /gateway/routes adds route; subsequent request to that path is proxied
+  AC2: isActive=false route does NOT proxy (returns 404)
+  AC3: PUT /gateway/routes/{id} with isActive toggled -> proxy updates without restart
+  AC4: Method mismatch on route -> YARP pass-through miss (404 or 405)
+  AC5: Integration test passes with real Postgres via Testcontainers
+
+Out of Scope: Auth enforcement in proxy, rate limit
+
+--------------------------------------------------------------------------------
+PHASE 5 -- Authentication & Authorization in Gateway
+--------------------------------------------------------------------------------
+Goal:
+  Gateway validates JWT tokens via JWKS (fetched from Auth Service) and API Keys
+  via DB lookup. Enforces authRequired and roles per route.
+
+Deliverables:
+  [ ] JwksService in Gateway.Infrastructure
+        fetches + caches RS256 public key from Auth Service /.well-known/jwks.json
+        refreshes on startup + every 6 hours
+  [ ] JWT bearer auth scheme in Gateway.API using cached public key
+  [ ] ApiKeyAuthHandler : AuthenticationHandler in Gateway.API
+        reads X-Api-Key header
+        SHA-256 hashes it, looks up in api_keys table
+        checks is_active and expires_at
+  [ ] Authentication middleware: try JWT first, fall back to API key
+  [ ] Authorization middleware: per-request check
+        authRequired=false -> skip auth entirely
+        authRequired=true, no token -> 401
+        authRequired=true, role not in route.roles -> 403
+  [ ] RoutesController endpoints now require admin JWT
+  [ ] Unit tests: valid JWT, expired JWT, valid API key, revoked API key, wrong role
+
+Acceptance Criteria:
+  AC1: Route with authRequired=false -> accessible without token
+  AC2: Route with authRequired=true, no token -> 401
+  AC3: Route with roles=["admin"], user-role JWT -> 403
+  AC4: Route with roles=["admin"], admin-role JWT -> proxied (200)
+  AC5: Valid X-Api-Key on service route -> authenticated as service principal
+  AC6: Revoked or expired API key -> 401
+  AC7: GET /gateway/routes without JWT -> 401
+
+Out of Scope: Rate limiting, metrics
+
+--------------------------------------------------------------------------------
+PHASE 6 -- Rate Limiting
+--------------------------------------------------------------------------------
+Goal:
+  Per-route, per-user sliding window rate limiting via Redis.
+  Exceeding limit returns 429 with Retry-After header.
+
+Deliverables:
+  [ ] StackExchange.Redis client registered in DI
+  [ ] RateLimitMiddleware in Gateway.API
+        runs after auth (userId from claims; IP for anonymous)
+        key: rate_limit:{userId}:{normalizedPath}
+        sliding window: INCR + EXPIRE on first request in window
+        if count > route.rateLimit.limit -> 429 + Retry-After: windowSeconds
+  [ ] Routes with no rateLimit config -> rate limiting skipped
+  [ ] Integration tests: N requests pass, N+1 returns 429; after TTL resets
+
+Acceptance Criteria:
+  AC1: limit=5/60s: requests 1-5 proxied; request 6 -> 429
+  AC2: 429 response includes Retry-After header with seconds remaining
+  AC3: After Redis TTL expires, counter resets; next request proxied
+  AC4: Route with no rateLimit config -> no rate limiting applied
+  AC5: Two different userIds do not share the same rate limit counter
+
+Out of Scope: Response caching (Phase 11), Prometheus metrics (Phase 7)
+
+--------------------------------------------------------------------------------
+PHASE 7 -- Observability
+--------------------------------------------------------------------------------
+Goal:
+  Prometheus metrics endpoint, JSON metrics summary API,
+  and Seq-backed logs query API all working.
+
+Deliverables:
+  [ ] prometheus-net.AspNetCore added to Gateway.API
+  [ ] MetricsMiddleware (position: after logging, before auth):
+        http_requests_total counter (labels: method, route, status_code)
+        http_request_duration_seconds histogram (labels: method, route)
+  [ ] GET /metrics -> Prometheus text scrape endpoint
+  [ ] GET /metrics/summary -> aggregated JSON computed from in-memory collectors
+  [ ] Logging middleware enriches each request log with:
+        route, method, statusCode, latencyMs, traceId, userId (if authed)
+  [ ] SeqLogsService in Gateway.Infrastructure
+        wraps Seq /api/events HTTP endpoint
+        supports filter params: status, route, from, to, page, pageSize
+  [ ] GET /logs -> calls SeqLogsService, returns paginated response
+  [ ] docker-compose: adds prometheus and grafana services
+  [ ] prometheus.yml scrape config pointing at Gateway /metrics
+
+Acceptance Criteria:
+  AC1: GET /metrics returns valid Prometheus text format with request counters
+  AC2: GET /metrics/summary returns correct JSON after known requests
+  AC3: GET /logs returns paginated results queried from Seq
+  AC4: GET /logs?status=500 returns only error-level entries
+  AC5: GET /logs?route=/orders filters by route property in Seq
+  AC6: Prometheus UI shows Gateway metrics; Grafana data source connects
+
+Out of Scope: Frontend, circuit breaker
+
+--------------------------------------------------------------------------------
+PHASE 8 -- React Frontend Foundation
+--------------------------------------------------------------------------------
+Goal:
+  React app scaffolded with routing, layout shell, auth store, and Axios
+  service layer wired to both backend services.
+
+Deliverables:
+  [ ] Vite + React 18 project in /frontend
+  [ ] Tailwind CSS + shadcn/ui configured
+  [ ] React Router v6: /login, /dashboard, /routes, /logs, /metrics
+  [ ] Zustand stores: useAuthStore (token, user, login, logout)
+      useRoutesStore, useMetricsStore (scaffolded, empty state)
+  [ ] Axios instance in services/api.js
+        baseURL: http://localhost:5000
+        request interceptor: attach Bearer token from useAuthStore
+        response interceptor: 401 -> clear store + redirect to /login
+  [ ] Login page: POST to Auth Service (http://localhost:5100/auth/login), store JWT
+  [ ] Layout.jsx: Navbar + Sidebar wrapping all protected routes
+  [ ] Protected route guard: redirect to /login if no token
+  [ ] Placeholder page components for all 4 protected routes
+
+Acceptance Criteria:
+  AC1: `npm run dev` starts without errors
+  AC2: Unauthenticated visit to /dashboard -> redirect to /login
+  AC3: Login with valid credentials -> JWT stored, redirect to /dashboard
+  AC4: All 4 protected routes render layout with Navbar + Sidebar
+  AC5: Axios interceptor attaches Authorization header on all API calls
+  AC6: 401 response from API -> logout + redirect to /login
+
+Out of Scope: Real data in charts/tables (Phases 9, 10)
+
+--------------------------------------------------------------------------------
+PHASE 9 -- Routes Management UI
+--------------------------------------------------------------------------------
+Goal:
+  Full route CRUD through the Admin UI with optimistic updates.
+
+Deliverables:
+  [ ] routesService.js: getRoutes(), createRoute(), updateRoute(), deleteRoute()
+  [ ] useRoutesStore: routes[], isLoading, error, CRUD actions with optimistic updates
+  [ ] RouteTable: columns (path, method, destination, authRequired, isActive, actions)
+        sortable by path and method
+        active/inactive badge
+        Edit + Delete action buttons
+  [ ] RouteForm: shadcn Dialog modal
+        create mode: empty form
+        edit mode: pre-populated
+        Zod schema validates all fields
+        react-hook-form manages state
+  [ ] DeleteDialog: shadcn AlertDialog confirmation
+  [ ] RoutesPage: composes table + form + delete dialog
+
+Acceptance Criteria:
+  AC1: RoutesPage loads and displays all routes from GET /gateway/routes
+  AC2: Create route via form -> POST sent -> new row appears without page reload
+  AC3: Edit route via form -> PUT sent -> row updates in place
+  AC4: Delete with confirmation -> DELETE sent -> row removed
+  AC5: Form with missing required field -> inline Zod error shown
+  AC6: API error on create/edit -> toast error message shown
+
+Out of Scope: Metrics charts, logs table
+
+--------------------------------------------------------------------------------
+PHASE 10 -- Metrics & Logs UI
+--------------------------------------------------------------------------------
+Goal:
+  DashboardPage and MetricsPage show live data.
+  LogsPage has filterable, paginated log viewer.
+
+Deliverables:
+  [ ] metricsService.js: getMetricsSummary()
+  [ ] logsService.js: getLogs(filters)
+  [ ] useMetricsStore: summary data, loading state, auto-poll every 30s
+  [ ] DashboardPage:
+        MetricsCards: totalRequests, errorRate, avgLatencyMs
+        RequestsChart: Recharts LineChart, requests over time
+        ErrorRateChart: Recharts AreaChart
+  [ ] MetricsPage:
+        Full-size charts
+        Rate Limit Monitor: per-route table (limit, windowSeconds)
+  [ ] LogsPage:
+        LogsFilters: status code, route, date range inputs
+        LogsTable: paginated, columns (timestamp, level, route, status, latency, traceId)
+        Pagination controls
+
+Acceptance Criteria:
+  AC1: MetricsCards show real values from GET /metrics/summary
+  AC2: Charts update on 30s poll without page refresh
+  AC3: LogsPage loads first page of logs on mount
+  AC4: Filtering by status=500 updates table to only show error logs
+  AC5: Filtering by route filters correctly
+  AC6: Pagination: page 2 loads next result set
+  AC7: Empty state shown when no logs match filters
+
+Out of Scope: Advanced features (Phase 11)
+
+--------------------------------------------------------------------------------
+PHASE 11 -- Advanced Features
+--------------------------------------------------------------------------------
+Goal:
+  Production-hardening: circuit breaker, retry, response caching,
+  request transformation, and role-based UI control.
+
+Deliverables:
+  [ ] Polly v8 ResiliencePipeline per route (configured from route metadata):
+        Retry: max 3 attempts, exponential backoff (base 200ms)
+        Circuit Breaker: open after 5 failures in 30s, half-open after 60s
+  [ ] Response caching middleware (after rate limit, before YARP):
+        key: cache:{method}:{path}:{queryHash}
+        Redis-backed, TTL per route config
+        Cache-Control: no-cache bypasses cache
+  [ ] Request transformation via YARP transforms config:
+        Header injection: X-Forwarded-User, X-Request-Id, X-Gateway-Version
+        Path prefix stripping (e.g. /api/v1/orders -> /orders on destination)
+  [ ] Role-based UI control:
+        useAuthStore exposes decoded roles from JWT
+        Admin-only actions hidden for viewer role
+        MetricsPage visible to both admin and viewer
+  [ ] README: ASCII architecture diagram, setup guide, API reference,
+      scaling notes, trade-off log
+
+Acceptance Criteria:
+  AC1: Failing downstream -> retry fires 3 times before returning 502
+  AC2: 5 consecutive failures -> circuit opens; subsequent calls get 503 immediately
+  AC3: After circuit TTL -> half-open; one probe request attempted
+  AC4: Cached route: second identical request served from cache, not forwarded
+  AC5: Cache bypassed when Cache-Control: no-cache sent
+  AC6: Forwarded request has X-Forwarded-User and X-Request-Id headers set
+  AC7: Viewer-role user cannot see Create / Edit / Delete buttons in UI
+  AC8: All new features have at least one integration test
+
+================================================================================
+10. PHASE DEPENDENCY CHAIN
+================================================================================
+
+Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6
+                                                             |
+                                                         Phase 7
+                                                             |
+                                                         Phase 8
+                                                             |
+                                                         Phase 9
+                                                             |
+                                                         Phase 10
+                                                             |
+                                                         Phase 11
+
+Rule: all Acceptance Criteria for phase N must pass before phase N+1 starts.
+
+================================================================================
+11. CROSS-CUTTING DECISIONS & TRADE-OFFS
+================================================================================
+
+Decision                    Choice                     Rationale
+-----------                 ------                     ---------
+Auth architecture           Separate Auth Service      Avoids coupling; realistic system design
+Token format                RS256 JWT                  Asymmetric; Gateway validates without
+                                                       calling Auth Service per request
+API Key storage             SHA-256 hash only          Raw key shown once; breach-safe
+Logs query backend          Seq HTTP API               Avoids duplicating logs in Postgres;
+                                                       Seq already has filtering and retention
+Rate limit algorithm        Redis sliding window       Accurate; distributed-safe
+Proxy engine                YARP                       Microsoft-supported; native ASP.NET DI
+Metrics storage             prometheus-net             In-process; no DB overhead
+Frontend state              Zustand                    Lightweight; no Redux boilerplate
+
+================================================================================
+12. OPEN QUESTIONS (RESOLVE BEFORE PHASE START)
+================================================================================
+
+[ ] RSA key pair -- generated on AuthService startup (dev) or loaded from
+    file/vault (prod)? Decide before Phase 3.
+
+[ ] Downstream services -- real containers or mock HTTP servers in tests?
+    Recommendation: WireMock.Net for integration tests.
+
+[ ] CORS -- which origins are allowed on Gateway.API?
+    Decide before Phase 8 frontend work.
+
+[ ] Admin seed user -- Phase 1 DB seed or Phase 3 register endpoint?
+
+================================================================================
+
+END OF DOCUMENT

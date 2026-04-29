@@ -1,0 +1,100 @@
+================================================================================
+FLUXGATE — HOW TO RUN
+================================================================================
+
+PREREQUISITES
+-------------
+  - Docker Desktop (must be running)
+  - .NET 8 SDK
+  - Node.js 20+
+
+
+STEP 1 — Start infrastructure (PostgreSQL, Redis, Seq, Prometheus, Grafana)
+----------------------------------------------------------------------------
+  cd d:\Per\Fluxgate
+  docker compose up -d
+
+
+STEP 2 — Apply DB migrations (first time only)
+-----------------------------------------------
+  cd d:\Per\Fluxgate
+
+  dotnet ef database update --project src/Gateway.Infrastructure --startup-project src/Gateway.API --context GatewayDbContext
+
+  dotnet ef database update --project src/Gateway.Infrastructure --startup-project src/Gateway.AuthService --context AuthDbContext
+
+
+STEP 3 — Start backend (open two terminals)
+--------------------------------------------
+  # Terminal 1 — API Gateway
+  cd d:\Per\Fluxgate
+  dotnet run --project src/Gateway.API
+  --> runs on http://localhost:5000
+
+  # Terminal 2 — Auth Service
+  cd d:\Per\Fluxgate
+  dotnet run --project src/Gateway.AuthService
+  --> runs on http://localhost:5100
+
+
+STEP 4 — Start frontend
+------------------------
+  cd d:\Per\Fluxgate\frontend
+  npm run dev
+  --> runs on http://localhost:5173
+
+
+STEP 5 — Open the app
+----------------------
+  Browser: http://localhost:5173
+  Log in with the seeded admin credentials.
+
+
+================================================================================
+USEFUL URLS
+================================================================================
+
+  Admin UI        http://localhost:5173
+  Gateway API     http://localhost:5000
+  Auth Service    http://localhost:5100
+  Seq (logs)      http://localhost:5341
+  Prometheus      http://localhost:9090
+  Grafana         http://localhost:3001     (login: admin / admin)
+  PostgreSQL      localhost:5432            (user: fluxgate / fluxgate)
+  Redis           localhost:6379
+
+
+================================================================================
+RUN TESTS
+================================================================================
+
+  cd d:\Per\Fluxgate
+  dotnet test
+  --> Expected: 72/72 passed
+
+
+================================================================================
+STOP EVERYTHING
+================================================================================
+
+  # Stop backend (Ctrl+C in each terminal)
+
+  # Stop Docker services
+  cd d:\Per\Fluxgate
+  docker compose down
+
+  # Stop Docker services AND delete all data (clean slate)
+  docker compose down -v
+
+
+================================================================================
+NOTES
+================================================================================
+
+  - Migrations only need to run once. Skip Step 2 on subsequent runs.
+  - If a dotnet build fails with "file locked", kill all dotnet processes:
+      Get-Process dotnet | Stop-Process -Force
+  - Frontend dev server hot-reloads on save — no restart needed.
+  - The seeded admin user is created by the AuthDbContext seed in the
+    Gateway.Infrastructure migrations.
+================================================================================
